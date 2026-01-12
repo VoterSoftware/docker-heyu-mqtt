@@ -1,8 +1,11 @@
 #!/usr/bin/perl
 use strict;
+use warnings;
 
 use AnyEvent::MQTT;
 use AnyEvent::Run;
+
+use File::Path qw(make_path);
 
 my $config = {
     mqtt_host      => $ENV{MQTT_HOST} || 'localhost',
@@ -15,7 +18,84 @@ my $config = {
 
     # If true, translate on/off -> fon/foff for CM17A Firecracker
     use_cm17       => ($ENV{USE_CM17} && $ENV{USE_CM17} =~ /^(1|true|yes|on)$/i) ? 1 : 0,
+
+    # NEW: Set Heyu x10.conf directive from env var (recommended: NO)
+    heyu_x10conf        => $ENV{HEYU_X10CONF} || '/etc/heyu/x10.conf',
+    heyu_check_ri_line  => $ENV{HEYU_CHECK_RI_LINE},  # e.g. "NO"
 };
+
+sub apply_x10conf_directive {
+    my (%args) = @_;
+    my $path  = $args{path};
+    my $key   = $args{key};
+    my $value = $args{value};
+
+    return if !defined($value) || $value eq '';
+
+    # Normalize value (optional, but helps avoid "no", "No", etc.)
+    $value =~ s/^\s+|\s+$//g;
+    $value = uc $value;
+
+    # Ensure directory exists
+    if ($path =~ m{^(.*)/[^/]+$}) {
+        my $dir = $1;
+        eval { make_path($dir) if $dir && !-d $dir; 1 } or do {
+            AE::log error => "Failed to create config dir '$dir': $@";
+            return;
+        };
+    }
+
+    my @lines;
+    if (-f $path) {
+        if (open my $in, '<', $path) {
+            @lines = <$in>;
+            close $in;
+        } else {
+            AE::log error => "Failed to read '$path': $!";
+            return;
+        }
+    } else {
+        @lines = ();
+    }
+
+    my $re = qr/^\s*\Q$key\E\b/i;
+    my $found = 0;
+
+    for my $line (@lines) {
+        if ($line =~ $re) {
+            $line  = "$key  $value\n";
+            $found = 1;
+        }
+    }
+
+    push @lines, "$key  $value\n" unless $found;
+
+    my $tmp = "$path.tmp.$$";
+    if (open my $out, '>', $tmp) {
+        print $out @lines;
+        close $out;
+
+        if (!rename $tmp, $path) {
+            AE::log error => "Failed to write '$path' (rename): $!";
+            unlink $tmp;
+            return;
+        }
+    } else {
+        AE::log error => "Failed to write temp '$tmp': $!";
+        return;
+    }
+
+    AE::log note => "Applied directive $key $value to $path";
+}
+
+# Apply CHECK_RI_LINE before we start heyu monitor / handle commands
+if (defined $config->{heyu_check_ri_line} && $config->{heyu_check_ri_line} ne '') {
+    apply_x10conf_directive(
+        path  => $config->{heyu_x10conf},
+        key   => 'CHECK_RI_LINE',
+        value => $config->{heyu_check_ri_line},
+    );
+}
 
 my $mqtt = AnyEvent::MQTT->new(
     host      => $config->{mqtt_host},
@@ -34,7 +114,7 @@ sub receive_mqtt_set {
 
     my $msg = lc($message // '');
 
-    if ($device eq "raw") { # send 'raw' message, for example "xpreset o3 32" or "fon c2"
+    if ($device eq "raw") { # e.g. "xpreset o3 32" or "fon c2"
         AE::log info => "X10 sending heyu command $message";
 
         # IMPORTANT: split multi-word commands into args for system()
@@ -83,10 +163,8 @@ sub broadcast_house_status {
 sub process_house_cmd {
     my ($cmd, $house) = @_;
 
-    # Normalize to lowercase
     $cmd = lc($cmd // '');
 
-    # Heyu monitor may emit variants like AllOff/LightsOn/etc
     my $status;
     if ($cmd eq 'alloff' || $cmd eq 'lightsoff') {
         $status = 0;
@@ -98,10 +176,7 @@ sub process_house_cmd {
 
     AE::log info => "House-wide command for $house: $cmd (broadcasting)";
 
-    # Publish an event (useful for HA automations)
     send_house_event($house, $cmd);
-
-    # Publish status updates for known devices in that house
     broadcast_house_status($house, $status);
 }
 
@@ -121,14 +196,14 @@ sub process_heyu_line {
         my ($cmd, $house) = ($1, $2);
         my $cmd_lc = lc $cmd;
 
-        # NEW: detect and broadcast house-wide commands (no unit specified)
+        # Detect and broadcast house-wide commands (no unit specified)
         if ($cmd_lc =~ /^(alloff|allon|lightson|lightsoff)$/) {
             process_house_cmd($cmd_lc, $house);
-            delete $addr_queue->{$house}; # clear any queued addresses
+            delete $addr_queue->{$house};
             return;
         }
 
-        # Existing behavior: apply function to queued units
+        # Apply function to queued units
         if ($addr_queue->{$house}) {
             for my $k (keys %{$addr_queue->{$house}}) {
                 process_heyu_cmd($cmd_lc, "$house$k", -1);
@@ -145,7 +220,6 @@ sub process_heyu_line {
 sub process_heyu_cmd {
     my ($cmd, $device, $level) = @_;
 
-    # Remember device so house-wide commands can update it later
     $known_devices->{$device} = 1;
 
     AE::log info => "Sending MQTT status for $device: $cmd";
